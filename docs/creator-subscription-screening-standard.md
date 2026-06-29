@@ -4,6 +4,8 @@
 
 本文沉淀运动创作者订阅名单的筛选口径。核心原则是: 原榜单只作为候选池, 最终能否进入订阅取决于内容库回查后的活跃度、质量和误判风险。
 
+对应实现: `scripts/filter_creator_subscriptions.py`。
+
 ## 目标
 
 订阅系统的目标是稳定获得新内容, 不是保存历史高热视频作者。因此筛选标准优先回答三个问题:
@@ -139,6 +141,34 @@ TikTok watchlist 可以用标题运动命中、活跃度、播放质量先粗筛
 - `instagram_canary_ready`: Instagram canary 池。
 - `tiktok_watchlist`: TikTok 观察池, 不直接导入。
 - `review_or_reject`: 不活跃、低质量、误判或证据不足的复核/剔除池。
+
+## 运行方式
+
+若已有内容库回查审计 CSV:
+
+```bash
+python scripts/filter_creator_subscriptions.py \
+  --audit-csv path/to/existing_subscription_list_audit.csv \
+  --output-dir out/subscriptions
+```
+
+若需要直接从内容库回查 `enum_v5.json` 候选:
+
+```bash
+ASSET_CENTER_DSN='postgres://...' \
+python scripts/filter_creator_subscriptions.py \
+  --candidates-json path/to/enum_v5.json \
+  --output-dir out/subscriptions
+```
+
+输出文件:
+
+- `all_subscription_audit.csv`
+- `youtube_subscription_ready.csv`
+- `instagram_canary_ready.csv`
+- `tiktok_watchlist.csv`
+- `review_or_reject.csv`
+- `platform_summary.csv`
 
 ## 2026-06-29 审计结论
 

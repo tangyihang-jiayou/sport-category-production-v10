@@ -20,6 +20,7 @@
 - 内容库回查: `asset_center.assets` 中的全库视频记录。
 - 主键: `platform + author_id`。
 - 回查字段: 全库视频数、有效播放视频数、最新发布时间、中位播放、中位互动率、最近标题样本、平台 category 样本。
+- 输入归一化: 脚本会把平台码统一为 `yt/ig/tk`, trim profile uid, 并把发布时间规范成 `YYYY-MM-DD` 后再比较。
 
 不得把抽样中的 `n` 直接等同于作者真实质量。抽样 `n` 只代表原候选榜对该作者的证据深度。
 
@@ -141,6 +142,45 @@ TikTok watchlist 可以用标题运动命中、活跃度、播放质量先粗筛
 - `instagram_canary_ready`: Instagram canary 池。
 - `tiktok_watchlist`: TikTok 观察池, 不直接导入。
 - `review_or_reject`: 不活跃、低质量、误判或证据不足的复核/剔除池。
+- `current_subscription_state`: 当前全量状态, 用于下一轮动态刷新。
+- `import_actions`: 本轮需要执行的新增、恢复、暂停或移除动作。
+
+## 动态刷新策略
+
+线上不是一次性名单, 而是周期刷新:
+
+1. 每日或每周重新读取候选池与内容库回查结果。
+2. 用同一套准入闸重新计算平台决策。
+3. 与上一轮 `current_subscription_state.csv` 对比。
+4. 输出本轮 `import_actions.csv`。
+5. 导入系统只消费 action, 不直接消费全量候选池。
+
+状态迁移:
+
+- `new`: 首次进入可前进名单。
+- `retained`: 上轮已在可前进名单, 本轮仍通过。
+- `reactivated`: 上轮在 review, 本轮重新通过。
+- `downgraded`: 上轮可前进, 本轮因不活跃、低质量或误判进入 review。
+- `missing_downgraded`: 上轮可前进, 本轮候选池或回查结果中未出现, 需要暂停或移除。
+- `still_review`: 连续留在复核/剔除池。
+- `missing_review`: 上轮已在 review, 本轮仍未出现, 继续保留复核状态。
+
+生命周期:
+
+- `active_subscription`: YouTube 正式订阅。
+- `canary`: Instagram 灰度订阅。
+- `watchlist`: TikTok 观察池。
+- `paused_review`: 曾经进入订阅/canary, 本轮降级, 需要暂停或移除。
+- `rejected_review`: 未通过准入闸, 暂不进入订阅。
+
+导入动作:
+
+- `upsert_subscription`: 新增或恢复 YouTube 订阅。
+- `upsert_canary`: 新增或恢复 Instagram canary。
+- `upsert_watchlist`: 新增或恢复 TikTok watchlist。
+- `pause_or_remove`: 已有订阅源本轮不再通过, 需暂停或移除。
+- `keep_subscription` / `keep_canary` / `keep_watchlist`: 无需导入动作, 只保留状态。
+- `hold_review`: 留在复核/剔除池。
 
 ## 运行方式
 
@@ -149,6 +189,9 @@ TikTok watchlist 可以用标题运动命中、活跃度、播放质量先粗筛
 ```bash
 python scripts/filter_creator_subscriptions.py \
   --audit-csv path/to/existing_subscription_list_audit.csv \
+  --previous-state out/subscriptions/current_subscription_state.csv \
+  --run-date 2026-06-29 \
+  --active-months 6 \
   --output-dir out/subscriptions
 ```
 
@@ -158,6 +201,9 @@ python scripts/filter_creator_subscriptions.py \
 ASSET_CENTER_DSN='postgres://...' \
 python scripts/filter_creator_subscriptions.py \
   --candidates-json path/to/enum_v5.json \
+  --previous-state out/subscriptions/current_subscription_state.csv \
+  --run-date 2026-06-29 \
+  --active-months 6 \
   --output-dir out/subscriptions
 ```
 
@@ -169,6 +215,8 @@ python scripts/filter_creator_subscriptions.py \
 - `tiktok_watchlist.csv`
 - `review_or_reject.csv`
 - `platform_summary.csv`
+- `current_subscription_state.csv`
+- `import_actions.csv`
 
 ## 2026-06-29 审计结论
 
@@ -184,10 +232,16 @@ python scripts/filter_creator_subscriptions.py \
 
 允许 A 档在通过内容库质量闸后加入时:
 
-- YouTube 可扩展到约 783 个。
-- Instagram 可扩展到约 1,976 个。
+- YouTube 可扩展到 783 个。
+- Instagram 可扩展到 1,975 个。
 
 因此最终建议采用扩展口径: A 档可以加入, 但必须通过活跃度、有效播放率、播放下限和误判检查。
+
+按 2026-06-29 的日历 6 个月口径重跑状态机:
+
+- 首次生成: `import_actions` 为 2,758 条, 即 783 个 YouTube 订阅 upsert + 1,975 个 Instagram canary upsert。
+- 同日带 `previous-state` 回放: `import_actions` 为 0 条, 证明不会重复导入。
+- 模拟上一轮 ready 账号本轮从候选池消失: 生成 1 条 `pause_or_remove`。
 
 ## 验收标准
 

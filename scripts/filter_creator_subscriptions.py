@@ -7,6 +7,7 @@ The script turns a creator candidate pool into operational subscription outputs:
 - Instagram creators that are ready for canary validation.
 - TikTok creators kept as watchlist only.
 - Review/reject rows with explicit reasons.
+- Stateful refresh outputs for ongoing operations.
 
 It can run in two modes:
 
@@ -27,14 +28,14 @@ import csv
 import io
 import os
 import re
+from calendar import monthrange
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
 
-ACTIVE_30_CUTOFF = "2026-05-30"
-ACTIVE_6M_CUTOFF = "2025-12-29"
 MIN_VALID_RATE = 0.5
 MIN_MEDIAN_VIEWS = 5_000
 MAX_MEDIAN_VIEWS = 50_000_000
@@ -69,12 +70,76 @@ OUTPUT_FIELDS = [
     "category_samples",
 ]
 
+STATE_FIELDS = OUTPUT_FIELDS + [
+    "run_date",
+    "lifecycle_state",
+    "transition",
+    "import_action",
+    "first_seen_at",
+    "last_seen_at",
+    "previous_decision",
+    "previous_issue",
+    "consecutive_good_runs",
+    "consecutive_bad_runs",
+]
+
 
 @dataclass
 class ScreenedRow:
     row: dict[str, str]
     decision: str
     issues: list[str]
+
+
+@dataclass(frozen=True)
+class ScreeningConfig:
+    run_date: str
+    active30_cutoff: str
+    active6m_cutoff: str
+    min_valid_rate: float = MIN_VALID_RATE
+    min_median_views: int = MIN_MEDIAN_VIEWS
+    max_median_views: int = MAX_MEDIAN_VIEWS
+
+
+def parse_ymd(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid date {value!r}; expected YYYY-MM-DD") from exc
+
+
+def subtract_months(value: date, months: int) -> date:
+    month_index = value.month - months - 1
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def build_config(
+    run_date: str,
+    active_days: int,
+    active_months: int,
+    active_month_days: int | None = None,
+) -> ScreeningConfig:
+    if active_days <= 0:
+        raise SystemExit("--active-days must be positive")
+    if active_months <= 0:
+        raise SystemExit("--active-months must be positive")
+    if active_month_days is not None and active_month_days <= 0:
+        raise SystemExit("--active-month-days must be positive when provided")
+
+    today = parse_ymd(run_date)
+    active6m_cutoff = (
+        today - timedelta(days=active_month_days)
+        if active_month_days is not None
+        else subtract_months(today, active_months)
+    )
+    return ScreeningConfig(
+        run_date=run_date,
+        active30_cutoff=(today - timedelta(days=active_days)).isoformat(),
+        active6m_cutoff=active6m_cutoff.isoformat(),
+    )
 
 
 def as_int(value: object, default: int = 0) -> int:
@@ -108,6 +173,32 @@ def parse_category_counts(raw: str) -> Counter[str]:
     return counts
 
 
+def normalize_platform(value: object) -> str:
+    platform = str(value or "").strip().lower()
+    if platform == "youtube":
+        return "yt"
+    if platform == "instagram":
+        return "ig"
+    if platform == "tiktok":
+        return "tk"
+    return platform
+
+
+def normalize_uid(value: object) -> str:
+    return str(value or "").strip()
+
+
+def normalize_pub_date(value: object) -> str:
+    raw = str(value or "").strip()
+    if len(raw) < 10:
+        return ""
+    candidate = raw[:10]
+    try:
+        return parse_ymd(candidate).isoformat()
+    except SystemExit:
+        return ""
+
+
 def is_hard_negative(row: dict[str, str]) -> bool:
     """Detect obvious non-sports false positives without over-blocking sports media.
 
@@ -123,7 +214,7 @@ def is_hard_negative(row: dict[str, str]) -> bool:
     return bool(AUTHOR_NEGATIVE_RE.search(name) or categories_only_bad)
 
 
-def screen_row(row: dict[str, str]) -> ScreenedRow:
+def screen_row(row: dict[str, str], config: ScreeningConfig) -> ScreenedRow:
     """Apply the actual subscription screening logic.
 
     S and A tiers are both eligible. A tier is not a rejection reason; it only
@@ -131,26 +222,29 @@ def screen_row(row: dict[str, str]) -> ScreenedRow:
     decide whether the creator can move forward.
     """
 
-    platform = row.get("platform", "")
+    platform = normalize_platform(row.get("platform") or row.get("plat"))
+    uid = normalize_uid(row.get("uid") or row.get("aid"))
     full_n = as_int(row.get("full_n"))
     valid_n = as_int(row.get("valid_n"))
     valid_rate = as_float(row.get("valid_rate"))
     if valid_rate == 0 and full_n:
         valid_rate = valid_n / full_n
 
-    recent_pub = row.get("recent_pub", "")
+    recent_pub = normalize_pub_date(row.get("recent_pub", ""))
     med_views = as_int(row.get("med_views"))
     issues: list[str] = []
 
+    if not uid:
+        issues.append("profile uid缺失")
     if full_n <= 0:
         issues.append("全库未匹配author_id")
-    if valid_rate < MIN_VALID_RATE:
+    if valid_rate < config.min_valid_rate:
         issues.append("有效播放率低")
-    if recent_pub < ACTIVE_6M_CUTOFF:
+    if recent_pub < config.active6m_cutoff:
         issues.append("近6月未见新作")
-    if med_views < MIN_MEDIAN_VIEWS:
+    if med_views < config.min_median_views:
         issues.append("中位播放低")
-    if med_views > MAX_MEDIAN_VIEWS:
+    if med_views > config.max_median_views:
         issues.append("中位播放异常高")
     if is_hard_negative(row):
         issues.append("疑似非运动/娱乐硬负例")
@@ -169,17 +263,21 @@ def screen_row(row: dict[str, str]) -> ScreenedRow:
         issues.append("未知平台")
 
     normalized = normalize_output_row(row)
+    normalized["platform"] = platform
+    normalized["uid"] = uid
+    normalized["recent_pub"] = recent_pub
     normalized["decision"] = decision
     normalized["issue"] = ";".join(issues) or "OK"
     normalized["valid_rate"] = f"{valid_rate:.3f}".rstrip("0").rstrip(".")
-    normalized["active30"] = "Y" if recent_pub >= ACTIVE_30_CUTOFF else ""
+    normalized["active30"] = "Y" if recent_pub >= config.active30_cutoff else ""
     return ScreenedRow(row=normalized, decision=decision, issues=issues)
 
 
 def normalize_output_row(row: dict[str, str]) -> dict[str, str]:
     output = {field: str(row.get(field, "") or "") for field in OUTPUT_FIELDS}
-    output["platform"] = output["platform"] or str(row.get("plat", "") or "")
-    output["uid"] = output["uid"] or str(row.get("aid", "") or "")
+    output["platform"] = normalize_platform(output["platform"] or row.get("plat", ""))
+    output["uid"] = normalize_uid(output["uid"] or row.get("aid", ""))
+    output["recent_pub"] = normalize_pub_date(output["recent_pub"])
     output["name"] = output["name"] or str(row.get("old_name", "") or row.get("db_author", "") or "")
     output["old_tier"] = output["old_tier"] or str(row.get("tier", "") or "")
     output["old_dom"] = output["old_dom"] or str(row.get("dom_l1", "") or "")
@@ -218,14 +316,149 @@ def sort_review(rows: list[dict[str, str]]) -> list[dict[str, str]]:
         rows,
         key=lambda row: (
             "疑似非运动/娱乐硬负例" not in row.get("issue", ""),
-            row.get("recent_pub", "") >= ACTIVE_6M_CUTOFF,
+            row.get("decision") == "review_or_reject",
             -as_int(row.get("med_views")),
         ),
     )
 
 
-def write_outputs(rows: list[dict[str, str]], output_dir: Path) -> None:
-    screened = [screen_row(row).row for row in rows]
+def is_forwardable(decision: str) -> bool:
+    return decision in {
+        "subscription_ready",
+        "canary_ready",
+        "watchlist_profile_unverified",
+    }
+
+
+def lifecycle_for(decision: str, previous_forwardable: bool) -> str:
+    if decision == "subscription_ready":
+        return "active_subscription"
+    if decision == "canary_ready":
+        return "canary"
+    if decision == "watchlist_profile_unverified":
+        return "watchlist"
+    if previous_forwardable:
+        return "paused_review"
+    return "rejected_review"
+
+
+def import_action_for(decision: str, transition: str) -> str:
+    if decision == "subscription_ready":
+        return "keep_subscription" if transition == "retained" else "upsert_subscription"
+    if decision == "canary_ready":
+        return "keep_canary" if transition == "retained" else "upsert_canary"
+    if decision == "watchlist_profile_unverified":
+        return "keep_watchlist" if transition == "retained" else "upsert_watchlist"
+    if transition == "downgraded":
+        return "pause_or_remove"
+    return "hold_review"
+
+
+def build_state_rows(
+    screened: list[dict[str, str]],
+    previous_state: dict[tuple[str, str], dict[str, str]],
+    config: ScreeningConfig,
+) -> list[dict[str, str]]:
+    state_rows: list[dict[str, str]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for row in screened:
+        key = (row.get("platform", ""), row.get("uid", ""))
+        seen_keys.add(key)
+        previous = previous_state.get(key, {})
+        previous_decision = previous.get("decision") or previous.get("previous_decision") or ""
+        previous_issue = previous.get("issue") or previous.get("previous_issue") or ""
+        was_forwardable = is_forwardable(previous_decision)
+        is_now_forwardable = is_forwardable(row.get("decision", ""))
+
+        if not previous and is_now_forwardable:
+            transition = "new"
+        elif not previous:
+            transition = "new_review"
+        elif was_forwardable and is_now_forwardable:
+            transition = "retained"
+        elif was_forwardable and not is_now_forwardable:
+            transition = "downgraded"
+        elif not was_forwardable and is_now_forwardable:
+            transition = "reactivated"
+        else:
+            transition = "still_review"
+
+        consecutive_good_runs = (
+            as_int(previous.get("consecutive_good_runs")) + 1 if is_now_forwardable else 0
+        )
+        consecutive_bad_runs = (
+            as_int(previous.get("consecutive_bad_runs")) + 1 if not is_now_forwardable else 0
+        )
+
+        state = {field: row.get(field, "") for field in OUTPUT_FIELDS}
+        state.update(
+            {
+                "run_date": config.run_date,
+                "lifecycle_state": lifecycle_for(row.get("decision", ""), was_forwardable),
+                "transition": transition,
+                "import_action": import_action_for(row.get("decision", ""), transition),
+                "first_seen_at": previous.get("first_seen_at") or config.run_date,
+                "last_seen_at": config.run_date,
+                "previous_decision": previous_decision,
+                "previous_issue": previous_issue,
+                "consecutive_good_runs": str(consecutive_good_runs),
+                "consecutive_bad_runs": str(consecutive_bad_runs),
+            }
+        )
+        state_rows.append(state)
+
+    for key, previous in previous_state.items():
+        if key in seen_keys:
+            continue
+        platform, uid = key
+        previous_decision = previous.get("decision") or previous.get("previous_decision") or ""
+        previous_issue = previous.get("issue") or previous.get("previous_issue") or ""
+        was_forwardable = is_forwardable(previous_decision)
+        transition = "missing_downgraded" if was_forwardable else "missing_review"
+
+        state = {field: previous.get(field, "") for field in OUTPUT_FIELDS}
+        state.update(
+            {
+                "platform": platform,
+                "uid": uid,
+                "decision": "missing_from_current_pool",
+                "issue": "本轮候选池未出现",
+                "run_date": config.run_date,
+                "lifecycle_state": "paused_review" if was_forwardable else "rejected_review",
+                "transition": transition,
+                "import_action": "pause_or_remove" if was_forwardable else "hold_review",
+                "first_seen_at": previous.get("first_seen_at") or config.run_date,
+                "last_seen_at": previous.get("last_seen_at") or previous.get("run_date") or "",
+                "previous_decision": previous_decision,
+                "previous_issue": previous_issue,
+                "consecutive_good_runs": "0",
+                "consecutive_bad_runs": str(as_int(previous.get("consecutive_bad_runs")) + 1),
+            }
+        )
+        state_rows.append(state)
+    return state_rows
+
+
+def read_previous_state(path: Path | None) -> dict[tuple[str, str], dict[str, str]]:
+    if not path:
+        return {}
+    rows = read_csv(path)
+    return {
+        (normalize_platform(row.get("platform", "")), normalize_uid(row.get("uid", ""))): row
+        for row in rows
+        if row.get("platform") and row.get("uid")
+    }
+
+
+def write_outputs(
+    rows: list[dict[str, str]],
+    output_dir: Path,
+    config: ScreeningConfig,
+    previous_state_path: Path | None = None,
+) -> None:
+    screened = [screen_row(row, config).row for row in rows]
+    previous_state = read_previous_state(previous_state_path)
+    state_rows = build_state_rows(screened, previous_state, config)
     by_platform: defaultdict[str, list[dict[str, str]]] = defaultdict(list)
     for row in screened:
         by_platform[row["platform"]].append(row)
@@ -249,13 +482,32 @@ def write_outputs(rows: list[dict[str, str]], output_dir: Path) -> None:
     )
 
     write_csv(output_dir / "all_subscription_audit.csv", screened)
+    write_csv(output_dir / "current_subscription_state.csv", state_rows, STATE_FIELDS)
+    write_csv(
+        output_dir / "import_actions.csv",
+        [
+            row
+            for row in state_rows
+            if row.get("import_action")
+            in {
+                "upsert_subscription",
+                "upsert_canary",
+                "upsert_watchlist",
+                "pause_or_remove",
+            }
+        ],
+        STATE_FIELDS,
+    )
     write_csv(output_dir / "youtube_subscription_ready.csv", youtube_ready)
     write_csv(output_dir / "instagram_canary_ready.csv", instagram_canary)
     write_csv(output_dir / "tiktok_watchlist.csv", tiktok_watchlist)
     write_csv(output_dir / "review_or_reject.csv", review)
 
     summary_rows = []
-    for platform, platform_rows in sorted((key, value) for key, value in by_platform.items() if value):
+    state_platforms = {row.get("platform", "") for row in state_rows if row.get("platform")}
+    current_platforms = {key for key, value in by_platform.items() if value}
+    for platform in sorted(current_platforms | state_platforms):
+        platform_rows = by_platform.get(platform, [])
         issue_counts: Counter[str] = Counter()
         for row in platform_rows:
             for issue in row.get("issue", "").split(";"):
@@ -275,6 +527,21 @@ def write_outputs(rows: list[dict[str, str]], output_dir: Path) -> None:
                     row.get("active30") == "Y" and row["decision"] != "review_or_reject"
                     for row in platform_rows
                 ),
+                "new": sum(
+                    row.get("transition") == "new"
+                    for row in state_rows
+                    if row.get("platform") == platform
+                ),
+                "reactivated": sum(
+                    row.get("transition") == "reactivated"
+                    for row in state_rows
+                    if row.get("platform") == platform
+                ),
+                "downgraded": sum(
+                    row.get("transition") in {"downgraded", "missing_downgraded"}
+                    for row in state_rows
+                    if row.get("platform") == platform
+                ),
                 "top_issues": "|".join(
                     f"{issue}:{count}" for issue, count in issue_counts.most_common(8)
                 ),
@@ -291,6 +558,9 @@ def write_outputs(rows: list[dict[str, str]], output_dir: Path) -> None:
             "watchlist",
             "review_or_reject",
             "active30_forward",
+            "new",
+            "reactivated",
+            "downgraded",
             "top_issues",
         ],
     )
@@ -372,8 +642,8 @@ def normalize_db_row(row: dict[str, object]) -> dict[str, str]:
             categories.update(str(item) for item in sample)
 
     return {
-        "platform": str(row.get("platform") or ""),
-        "uid": str(row.get("uid") or ""),
+        "platform": normalize_platform(row.get("platform")),
+        "uid": normalize_uid(row.get("uid")),
         "name": str(row.get("old_name") or row.get("db_author") or ""),
         "old_tier": str(row.get("old_tier") or ""),
         "old_dom": str(row.get("old_dom") or ""),
@@ -433,11 +703,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidates-json", type=Path, help="enum_v5.json candidate pool")
     parser.add_argument("--dsn", default=os.getenv("ASSET_CENTER_DSN"), help="Postgres DSN")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for output CSVs")
+    parser.add_argument(
+        "--previous-state",
+        type=Path,
+        help="Previous current_subscription_state.csv for transition/import-action output",
+    )
+    parser.add_argument(
+        "--run-date",
+        default=date.today().isoformat(),
+        help="Refresh date in YYYY-MM-DD; defaults to today",
+    )
+    parser.add_argument(
+        "--active-days",
+        type=int,
+        default=30,
+        help="Days for the active30 priority flag",
+    )
+    parser.add_argument(
+        "--active-months",
+        type=int,
+        default=6,
+        help="Calendar months for the hard activity gate",
+    )
+    parser.add_argument(
+        "--active-month-days",
+        type=int,
+        help="Optional day-based override for the hard activity gate",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    config = build_config(args.run_date, args.active_days, args.active_months, args.active_month_days)
     if args.audit_csv:
         rows = read_csv(args.audit_csv)
     elif args.candidates_json:
@@ -447,7 +745,7 @@ def main() -> None:
     else:
         raise SystemExit("Pass either --audit-csv or --candidates-json")
 
-    write_outputs(rows, args.output_dir)
+    write_outputs(rows, args.output_dir, config, args.previous_state)
     print(f"wrote subscription screening outputs to {args.output_dir}")
 
 

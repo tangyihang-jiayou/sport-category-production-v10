@@ -1,5 +1,6 @@
 # 运动品类离线生产方案 (V10)
 
+- **Cloudflare Pages**: https://sport-category-production-v10.pages.dev/
 - **index.html** — 全品类排名 + TOP10 选题方案(20万池),可浏览器打开
 - **选题_TOP10_2000.json / 选题_TOP10_10000.json** — TOP10 抽样选题(两档配比;原始 topic 字段 + l1/l2/rank)
 - **运动数据筛选分类逻辑词库_V10.xlsx** — V10 分类词表(L1 52 / L2,含优先级 + 正则修复)
